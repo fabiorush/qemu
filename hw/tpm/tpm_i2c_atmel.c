@@ -23,7 +23,7 @@
 
 #define DPRINTF(fmt, ...) do { \
     if (DEBUG_TIS) { \
-        printf("%s: %d - " fmt,  __FILE__, __LINE__, ## __VA_ARGS__); \
+        printf(fmt, ## __VA_ARGS__); \
     } \
 } while (0);
 
@@ -94,82 +94,168 @@
      TPM_TIS_IFACE_ID_CAP_5_LOCALITIES | \
      TPM_TIS_IFACE_ID_CAP_TIS_SUPPORTED)
 
-// /* Size of NVRAM including both the user-accessible area and the
-//  * secondary register area.
-//  */
-// #define NVRAM_SIZE 64
-
-// /* Flags definitions */
-// #define SECONDS_CH 0x80
-// #define HOURS_12   0x40
-// #define HOURS_PM   0x20
-// #define CTRL_OSF   0x20
-
-// #define TPM_I2C_ATMEL(obj) OBJECT_CHECK(TPM_I2C_ATMELState, (obj), TYPE_TPM_I2C_ATMEL)
-
-// typedef struct TPM_I2C_ATMELState {
-//     I2CSlave parent_obj;
-
-//     int64_t offset;
-//     uint8_t wday_offset;
-//     uint8_t nvram[NVRAM_SIZE];
-//     int32_t ptr;
-//     bool addr_byte;
-// } TPM_I2C_ATMELState;
+#define TPM_TIS_NO_DATA_BYTE  0xff
 
 static const VMStateDescription vmstate_tpm_i2c_atmel = {
     .name = "tpm",
     .unmigratable = 1,
-//     .name = "tpm_i2c_atmel",
-//     .version_id = 2,
-//     .minimum_version_id = 1,
-//     .fields = (VMStateField[]) {
-//         VMSTATE_I2C_SLAVE(parent_obj, TPM_I2C_ATMELState),
-//         VMSTATE_INT64(offset, TPM_I2C_ATMELState),
-//         VMSTATE_UINT8_V(wday_offset, TPM_I2C_ATMELState, 2),
-//         VMSTATE_UINT8_ARRAY(nvram, TPM_I2C_ATMELState, NVRAM_SIZE),
-//         VMSTATE_INT32(ptr, TPM_I2C_ATMELState),
-//         VMSTATE_BOOL(addr_byte, TPM_I2C_ATMELState),
-//         VMSTATE_END_OF_LIST()
-//     }
 };
 
-uint8_t tx_buffer[100];
-uint8_t *tx_idx = tx_buffer;
-size_t tx_len = 0;
+static uint32_t tpm_i2c_atmel_get_size_from_buffer(const TPMSizedBuffer *sb)
+{
+    return be32_to_cpu(*(uint32_t *)&sb->buffer[2]);
+}
 
-uint8_t rx_buffer[100];
-uint8_t *rx_idx = rx_buffer;
-size_t rx_len = 0;
+static void tpm_i2c_atmel_show_buffer(const TPMSizedBuffer *sb, const char *string)
+{
+#ifdef DEBUG_TIS
+    uint32_t len, i;
+
+    len = tpm_i2c_atmel_get_size_from_buffer(sb);
+    DPRINTF("tpm_tis: %s length = %d\n", string, len);
+    for (i = 0; i < len; i++) {
+        if (i && !(i % 16)) {
+            DPRINTF("\n");
+        }
+        DPRINTF("%.2X ", sb->buffer[i]);
+    }
+    DPRINTF("\n");
+#endif
+}
+
+/*
+ * Set the given flags in the STS register by clearing the register but
+ * preserving the SELFTEST_DONE and TPM_FAMILY_MASK flags and then setting
+ * the new flags.
+ *
+ * The SELFTEST_DONE flag is acquired from the backend that determines it by
+ * peeking into TPM commands.
+ *
+ * A VM suspend/resume will preserve the flag by storing it into the VM
+ * device state, but the backend will not remember it when QEMU is started
+ * again. Therefore, we cache the flag here. Once set, it will not be unset
+ * except by a reset.
+ */
+static void tpm_i2c_atmel_sts_set(TPMLocality *l, uint32_t flags)
+{
+    l->sts &= TPM_TIS_STS_SELFTEST_DONE | TPM_TIS_STS_TPM_FAMILY_MASK;
+    l->sts |= flags;
+}
+
+/*
+ * Send a request to the TPM.
+ */
+static void tpm_i2c_atmel_tpm_send(TPMState *s, uint8_t locty)
+{
+    TPMTISEmuState *tis = &s->s.tis;
+
+    tpm_i2c_atmel_show_buffer(&tis->loc[locty].w_buffer, "tpm_tis: To TPM");
+
+    s->locty_number = locty;
+    s->locty_data = &tis->loc[locty];
+
+    /*
+     * w_offset serves as length indicator for length of data;
+     * it's reset when the response comes back
+     */
+    tis->loc[locty].state = TPM_TIS_STATE_EXECUTION;
+
+    tpm_backend_deliver_request(s->be_driver);
+}
+
+/* abort -- this function switches the locality */
+// static void tpm_i2c_atmel_abort(TPMState *s, uint8_t locty)
+// {
+//     TPMTISEmuState *tis = &s->s.tis;
+
+//     tis->loc[locty].r_offset = 0;
+//     tis->loc[locty].w_offset = 0;
+
+//     DPRINTF("tpm_tis: tis_abort: new active locality is %d\n", tis->next_locty);
+
+//     /*
+//      * Need to react differently depending on who's aborting now and
+//      * which locality will become active afterwards.
+//      */
+//     if (tis->aborting_locty == tis->next_locty) {
+//         tis->loc[tis->aborting_locty].state = TPM_TIS_STATE_READY;
+//         tpm_tis_sts_set(&tis->loc[tis->aborting_locty],
+//                         TPM_TIS_STS_COMMAND_READY);
+//         tpm_tis_raise_irq(s, tis->aborting_locty, TPM_TIS_INT_COMMAND_READY);
+//     }
+
+//     /* locality after abort is another one than the current one */
+//     tpm_tis_new_active_locality(s, tis->next_locty);
+
+//     tis->next_locty = TPM_TIS_NO_LOCALITY;
+//     /* nobody's aborting a command anymore */
+//     tis->aborting_locty = TPM_TIS_NO_LOCALITY;
+// }
+
+
+static void tpm_i2c_atmel_receive_bh(void *opaque)
+{
+    TPMState *s = opaque;
+    TPMTISEmuState *tis = &s->s.tis;
+    uint8_t locty = s->locty_number;
+
+    tpm_i2c_atmel_sts_set(&tis->loc[locty],
+                    TPM_TIS_STS_VALID | TPM_TIS_STS_DATA_AVAILABLE);
+    tis->loc[locty].state = TPM_TIS_STATE_COMPLETION;
+    tis->loc[locty].r_offset = 0;
+    tis->loc[locty].w_offset = 0;
+
+    // if (TPM_TIS_IS_VALID_LOCTY(tis->next_locty)) {
+    //     tpm_i2c_atmel_abort(s, locty);
+    // }
+
+}
+
+/*
+ * Read a byte of response data
+ */
+static uint32_t tpm_i2c_atmel_data_read(TPMState *s, uint8_t locty)
+{
+    TPMTISEmuState *tis = &s->s.tis;
+    uint32_t ret = TPM_TIS_NO_DATA_BYTE;
+    uint16_t len;
+
+    if ((tis->loc[locty].sts & TPM_TIS_STS_DATA_AVAILABLE)) {
+        len = tpm_i2c_atmel_get_size_from_buffer(&tis->loc[locty].r_buffer);
+
+        ret = tis->loc[locty].r_buffer.buffer[tis->loc[locty].r_offset++];
+        if (tis->loc[locty].r_offset >= len) {
+            /* got last byte */
+            tpm_i2c_atmel_sts_set(&tis->loc[locty], TPM_TIS_STS_VALID);
+// #ifdef RAISE_STS_IRQ
+//             tpm_tis_raise_irq(s, locty, TPM_TIS_INT_STS_VALID);
+// #endif
+        }
+        DPRINTF("tpm_tis: tpm_i2c_atmel_data_read byte 0x%02x   [%d]\n",
+                ret, tis->loc[locty].r_offset-1);
+    }
+
+    return ret;
+}
 
 static void tpm_i2c_atmel_event(I2CSlave *i2c, enum i2c_event event)
 {
-    //TPM_I2C_ATMELState *s = TPM_I2C_ATMEL(i2c);
+    TPMState *s = TPM(&(i2c->qdev));
+    TPMTISEmuState *tis = &s->s.tis;
 
     switch (event) {
     case I2C_START_RECV:
-        /* In h/w, capture happens on any START condition, not just a
-         * START_RECV, but there is no need to actually capture on
-         * START_SEND, because the guest can't get at that data
-         * without going through a START_RECV which would overwrite it.
-         */
         DPRINTF("I2C_START_RECV\n");
-        rx_idx = rx_buffer;
+        //tis->loc[0].r_offset = 0;
         break;
     case I2C_START_SEND:
-        //s->addr_byte = true;
         DPRINTF("I2C_START_SEND\n");
-        tx_idx = tx_buffer;
+        tis->loc[0].w_offset = 0;
         break;
     case I2C_FINISH:
         DPRINTF("I2C_FINISH\n");
-        if (tx_idx != tx_buffer) {
-            DPRINTF("Sending %ld bytes to backend\n", tx_idx - tx_buffer);
-            tx_idx = tx_buffer;
-        }
-        if (rx_idx != rx_buffer) {
-            DPRINTF("Receiving %ld bytes from backend\n", rx_idx - rx_buffer);
-            rx_idx = rx_buffer;
+        if (tis->loc[0].w_offset) {
+            tpm_i2c_atmel_tpm_send(s, 0);
         }
         break;
     case I2C_NACK:
@@ -183,92 +269,19 @@ static void tpm_i2c_atmel_event(I2CSlave *i2c, enum i2c_event event)
 
 static int tpm_i2c_atmel_recv(I2CSlave *i2c)
 {
-    /*TPM_I2C_ATMELState *s = TPM_I2C_ATMEL(i2c);
-    uint8_t res;
-
-    res  = s->nvram[s->ptr];
-    inc_regptr(s);
-    return res;*/
     // DPRINTF("tpm_i2c_atmel_recv\n");
-    rx_idx++;
-    return 0;
+    TPMState *s = TPM(&(i2c->qdev));
+    return tpm_i2c_atmel_data_read(s, 0);
+    // rx_idx++;
+    // return 0;
 }
 
 static int tpm_i2c_atmel_send(I2CSlave *i2c, uint8_t data)
 {
-    #if 0
-    TPM_I2C_ATMELState *s = TPM_I2C_ATMEL(i2c);
-
-    if (s->addr_byte) {
-        s->ptr = data & (NVRAM_SIZE - 1);
-        s->addr_byte = false;
-        return 0;
-    }
-    if (s->ptr < 7) {
-        /* Time register. */
-        struct tm now;
-        qemu_get_timedate(&now, s->offset);
-        switch(s->ptr) {
-        case 0:
-            /* TODO: Implement CH (stop) bit.  */
-            now.tm_sec = from_bcd(data & 0x7f);
-            break;
-        case 1:
-            now.tm_min = from_bcd(data & 0x7f);
-            break;
-        case 2:
-            if (data & HOURS_12) {
-                int tmp = from_bcd(data & (HOURS_PM - 1));
-                if (data & HOURS_PM) {
-                    tmp += 12;
-                }
-                if (tmp % 12 == 0) {
-                    tmp -= 12;
-                }
-                now.tm_hour = tmp;
-            } else {
-                now.tm_hour = from_bcd(data & (HOURS_12 - 1));
-            }
-            break;
-        case 3:
-            {
-                /* The day field is supposed to contain a value in
-                   the range 1-7. Otherwise behavior is undefined.
-                 */
-                int user_wday = (data & 7) - 1;
-                s->wday_offset = (user_wday - now.tm_wday + 7) % 7;
-            }
-            break;
-        case 4:
-            now.tm_mday = from_bcd(data & 0x3f);
-            break;
-        case 5:
-            now.tm_mon = from_bcd(data & 0x1f) - 1;
-            break;
-        case 6:
-            now.tm_year = from_bcd(data) + 100;
-            break;
-        }
-        s->offset = qemu_timedate_diff(&now);
-    } else if (s->ptr == 7) {
-        /* Control register. */
-
-        /* Ensure bits 2, 3 and 6 will read back as zero. */
-        data &= 0xB3;
-
-        /* Attempting to write the OSF flag to logic 1 leaves the
-           value unchanged. */
-        data = (data & ~CTRL_OSF) | (data & s->nvram[s->ptr] & CTRL_OSF);
-
-        s->nvram[s->ptr] = data;
-    } else {
-        s->nvram[s->ptr] = data;
-    }
-    inc_regptr(s);
-    #endif
+    TPMState *s = TPM(&(i2c->qdev));
+    TPMTISEmuState *tis = &s->s.tis;
     // DPRINTF("tpm_i2c_atmel_send - data: 0x%02x\n", data);
-    *tx_idx++ = data;
-
+    tis->loc[0].w_buffer.buffer[tis->loc[0].w_offset++] = data;
     return 0;
 }
 static void tpm_i2c_atmel_receive_cb(TPMState *s, uint8_t locty,
@@ -316,7 +329,7 @@ static void tpm_i2c_atmel_realizefn(DeviceState *dev, Error **errp)
         return;
     }
 
-    // tis->bh = qemu_bh_new(tpm_tis_receive_bh, s);
+    tis->bh = qemu_bh_new(tpm_i2c_atmel_receive_bh, s);
 
     // isa_init_irq(&s->busdev, &tis->irq, tis->irq_num);
 
