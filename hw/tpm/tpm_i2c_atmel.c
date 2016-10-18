@@ -19,7 +19,7 @@
 #include "tpm_int.h"
 #include "qapi/error.h"
 
-#define DEBUG_TIS 1
+#define DEBUG_TIS 0
 
 #define DPRINTF(fmt, ...) do { \
     if (DEBUG_TIS) { \
@@ -204,6 +204,7 @@ static void tpm_i2c_atmel_receive_bh(void *opaque)
     tis->loc[locty].state = TPM_TIS_STATE_COMPLETION;
     tis->loc[locty].r_offset = 0;
     tis->loc[locty].w_offset = 0;
+    DPRINTF("tpm_i2c_atmel: tpm_i2c_atmel_receive_bh locty [%d]\n", locty);
 
     // if (TPM_TIS_IS_VALID_LOCTY(tis->next_locty)) {
     //     tpm_i2c_atmel_abort(s, locty);
@@ -231,8 +232,11 @@ static uint32_t tpm_i2c_atmel_data_read(TPMState *s, uint8_t locty)
 //             tpm_tis_raise_irq(s, locty, TPM_TIS_INT_STS_VALID);
 // #endif
         }
-        DPRINTF("tpm_tis: tpm_i2c_atmel_data_read byte 0x%02x   [%d]\n",
+        DPRINTF("tpm_i2c_atmel: tpm_i2c_atmel_data_read byte 0x%02x   [%d]\n",
                 ret, tis->loc[locty].r_offset-1);
+    } else {
+        DPRINTF("tpm_i2c_atmel: !TPM_TIS_STS_DATA_AVAILABLE [%d]\n",
+                tis->loc[locty].sts);
     }
 
     return ret;
@@ -251,6 +255,7 @@ static void tpm_i2c_atmel_event(I2CSlave *i2c, enum i2c_event event)
     case I2C_START_SEND:
         DPRINTF("I2C_START_SEND\n");
         tis->loc[0].w_offset = 0;
+        tis->loc[0].r_offset = 0;
         break;
     case I2C_FINISH:
         DPRINTF("I2C_FINISH\n");
