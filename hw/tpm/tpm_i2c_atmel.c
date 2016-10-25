@@ -228,9 +228,6 @@ static uint32_t tpm_i2c_atmel_data_read(TPMState *s, uint8_t locty)
         if (tis->loc[locty].r_offset >= len) {
             /* got last byte */
             tpm_i2c_atmel_sts_set(&tis->loc[locty], TPM_TIS_STS_VALID);
-// #ifdef RAISE_STS_IRQ
-//             tpm_tis_raise_irq(s, locty, TPM_TIS_INT_STS_VALID);
-// #endif
         }
         DPRINTF("tpm_i2c_atmel: tpm_i2c_atmel_data_read byte 0x%02x   [%d]\n",
                 ret, tis->loc[locty].r_offset-1);
@@ -246,11 +243,11 @@ static void tpm_i2c_atmel_event(I2CSlave *i2c, enum i2c_event event)
 {
     TPMState *s = TPM(&(i2c->qdev));
     TPMTISEmuState *tis = &s->s.tis;
+    i2c->busy = 0;
 
     switch (event) {
     case I2C_START_RECV:
-        DPRINTF("I2C_START_RECV\n");
-        //tis->loc[0].r_offset = 0;
+        i2c->busy = !(tis->loc[0].sts & TPM_TIS_STS_DATA_AVAILABLE);
         break;
     case I2C_START_SEND:
         DPRINTF("I2C_START_SEND\n");
@@ -259,7 +256,8 @@ static void tpm_i2c_atmel_event(I2CSlave *i2c, enum i2c_event event)
         break;
     case I2C_FINISH:
         DPRINTF("I2C_FINISH\n");
-        if (tis->loc[0].w_offset) {
+        if (tis->loc[0].w_offset &&
+            tis->loc[0].state != TPM_TIS_STATE_EXECUTION) {
             tpm_i2c_atmel_tpm_send(s, 0);
         }
         break;
@@ -274,18 +272,14 @@ static void tpm_i2c_atmel_event(I2CSlave *i2c, enum i2c_event event)
 
 static int tpm_i2c_atmel_recv(I2CSlave *i2c)
 {
-    // DPRINTF("tpm_i2c_atmel_recv\n");
     TPMState *s = TPM(&(i2c->qdev));
     return tpm_i2c_atmel_data_read(s, 0);
-    // rx_idx++;
-    // return 0;
 }
 
 static int tpm_i2c_atmel_send(I2CSlave *i2c, uint8_t data)
 {
     TPMState *s = TPM(&(i2c->qdev));
     TPMTISEmuState *tis = &s->s.tis;
-    // DPRINTF("tpm_i2c_atmel_send - data: 0x%02x\n", data);
     tis->loc[0].w_buffer.buffer[tis->loc[0].w_offset++] = data;
     return 0;
 }
@@ -335,11 +329,6 @@ static void tpm_i2c_atmel_realizefn(DeviceState *dev, Error **errp)
     }
 
     tis->bh = qemu_bh_new(tpm_i2c_atmel_receive_bh, s);
-
-    // isa_init_irq(&s->busdev, &tis->irq, tis->irq_num);
-
-    // memory_region_add_subregion(isa_address_space(ISA_DEVICE(dev)),
-    //                             TPM_TIS_ADDR_BASE, &s->mmio);
 }
 
 static int tpm_i2c_atmel_do_startup_tpm(TPMState *s)
@@ -381,8 +370,6 @@ static void tpm_i2c_atmel_reset(DeviceState *dev)
             tis->loc[c].iface_id = TPM_TIS_IFACE_ID_SUPPORTED_FLAGS2_0;
             break;
         }
-        // tis->loc[c].inte = TPM_TIS_INT_POLARITY_LOW_LEVEL;
-        // tis->loc[c].ints = 0;
         tis->loc[c].state = TPM_TIS_STATE_IDLE;
 
         tis->loc[c].w_offset = 0;
@@ -417,10 +404,8 @@ static void tpm_i2c_atmel_class_init(ObjectClass *klass, void *data)
 }
 
 static const TypeInfo tpm_i2c_atmel_info = {
-    // .name          = TYPE_TPM_I2C_ATMEL,
     .name          = TYPE_TPM_TIS,
     .parent        = TYPE_I2C_SLAVE,
-    // .instance_size = sizeof(TPM_I2C_ATMELState),
     .instance_size = sizeof(TPMState),
     .class_init    = tpm_i2c_atmel_class_init,
 };

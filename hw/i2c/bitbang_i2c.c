@@ -133,29 +133,26 @@ int bitbang_i2c_set(bitbang_i2c_interface *i2c, int line, int level)
         if (i2c->current_addr < 0) {
             i2c->current_addr = i2c->buffer;
             DPRINTF("Address 0x%02x\n", i2c->current_addr);
-            i2c_start_transfer(i2c->bus, i2c->current_addr >> 1,
+            ret = i2c_start_transfer(i2c->bus, i2c->current_addr >> 1,
                                i2c->current_addr & 1);
         } else {
             DPRINTF("Sent 0x%02x\n", i2c->buffer);
             i2c_send(i2c->bus, i2c->buffer);
         }
-        if (i2c->current_addr & 1) {
-            i2c->state = RECEIVING_BIT7;
-            return bitbang_i2c_ret(i2c, 1);
-        } else {
-            i2c->state = SENDING_BIT7;
-        }
-        return bitbang_i2c_ret(i2c, 0);
-
-    case RECEIVING_BIT7:
-        ret = i2c_recv(i2c->bus);
         if (ret < 0) {
             bitbang_i2c_enter_stop(i2c);
             return bitbang_i2c_ret(i2c, 1);
         } else {
-            i2c->buffer = i2c_recv(i2c->bus);
-            DPRINTF("RX byte 0x%02x\n", i2c->buffer);
+            if (i2c->current_addr & 1) {
+                i2c->state = RECEIVING_BIT7;
+            } else {
+                i2c->state = SENDING_BIT7;
+            }
+            return bitbang_i2c_ret(i2c, 0);
         }
+    case RECEIVING_BIT7:
+        i2c->buffer = i2c_recv(i2c->bus);
+        DPRINTF("RX byte 0x%02x\n", i2c->buffer);
         /* Fall through... */
     case RECEIVING_BIT6 ... RECEIVING_BIT0:
         data = i2c->buffer >> 7;
