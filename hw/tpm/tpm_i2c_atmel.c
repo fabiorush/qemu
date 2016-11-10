@@ -1,14 +1,26 @@
 /*
- * MAXIM TPM_I2C_ATMEL I2C RTC+NVRAM
+ * tpm_i2c_atmel.c - QEMU's TPM I2C interface emulator
  *
- * Copyright (c) 2009 CodeSourcery.
- * Written by Paul Brook
+ * Copyright (C) 2012, HPE Corporation
  *
- * This code is licensed under the GNU GPL v2.
+ * Authors:
+ *  Fabio Urquiza <fabio.urquiza@hpe.com>
  *
- * Contributions after 2012-01-13 are licensed under the terms of the
- * GNU GPL, version 2 or (at your option) any later version.
+ * Based on tpm_tis.c:
+ *  Stefan Berger <stefanb@us.ibm.com>
+ *  David Safford <safford@us.ibm.com>
+ *
+ * This work is licensed under the terms of the GNU GPL, version 2 or later.
+ * See the COPYING file in the top-level directory.
+ *
+ * Implementation of the TIS I2C interface according to specs found at
+ * http://www.trustedcomputinggroup.org. This implementation currently
+ * supports version 1.2 Atmel AT97SC3204T CI, 10 December 2016
+ *
+ * TPM I2C for TPM 2 implementation following TCG TPM I2C Interface
+ * Specification TPM Profile (PTP) Specification, Familiy 2.0, Revision 1.0
  */
+
 
 #include "qemu/osdep.h"
 #include "qemu-common.h"
@@ -28,53 +40,15 @@
 } while (0);
 
 /* vendor-specific registers */
-#define TPM_TIS_REG_DEBUG                 0xf90
-
 #define TPM_TIS_STS_TPM_FAMILY_MASK         (0x3 << 26)/* TPM 2.0 */
 #define TPM_TIS_STS_TPM_FAMILY1_2           (0 << 26)  /* TPM 2.0 */
 #define TPM_TIS_STS_TPM_FAMILY2_0           (1 << 26)  /* TPM 2.0 */
-#define TPM_TIS_STS_RESET_ESTABLISHMENT_BIT (1 << 25)  /* TPM 2.0 */
-#define TPM_TIS_STS_COMMAND_CANCEL          (1 << 24)  /* TPM 2.0 */
 
 #define TPM_TIS_STS_VALID                 (1 << 7)
-#define TPM_TIS_STS_COMMAND_READY         (1 << 6)
-#define TPM_TIS_STS_TPM_GO                (1 << 5)
 #define TPM_TIS_STS_DATA_AVAILABLE        (1 << 4)
-#define TPM_TIS_STS_EXPECT                (1 << 3)
 #define TPM_TIS_STS_SELFTEST_DONE         (1 << 2)
-#define TPM_TIS_STS_RESPONSE_RETRY        (1 << 1)
-
-#define TPM_TIS_BURST_COUNT_SHIFT         8
-#define TPM_TIS_BURST_COUNT(X) \
-    ((X) << TPM_TIS_BURST_COUNT_SHIFT)
 
 #define TPM_TIS_ACCESS_TPM_REG_VALID_STS  (1 << 7)
-#define TPM_TIS_ACCESS_ACTIVE_LOCALITY    (1 << 5)
-#define TPM_TIS_ACCESS_BEEN_SEIZED        (1 << 4)
-#define TPM_TIS_ACCESS_SEIZE              (1 << 3)
-#define TPM_TIS_ACCESS_PENDING_REQUEST    (1 << 2)
-#define TPM_TIS_ACCESS_REQUEST_USE        (1 << 1)
-#define TPM_TIS_ACCESS_TPM_ESTABLISHMENT  (1 << 0)
-
-#define TPM_TIS_CAP_INTERFACE_VERSION1_3 (2 << 28)
-#define TPM_TIS_CAP_INTERFACE_VERSION1_3_FOR_TPM2_0 (3 << 28)
-#define TPM_TIS_CAP_DATA_TRANSFER_64B    (3 << 9)
-#define TPM_TIS_CAP_DATA_TRANSFER_LEGACY (0 << 9)
-#define TPM_TIS_CAP_BURST_COUNT_DYNAMIC  (0 << 8)
-#define TPM_TIS_CAP_INTERRUPT_LOW_LEVEL  (1 << 4) /* support is mandatory */
-#define TPM_TIS_CAPABILITIES_SUPPORTED1_3 \
-    (TPM_TIS_CAP_INTERRUPT_LOW_LEVEL | \
-     TPM_TIS_CAP_BURST_COUNT_DYNAMIC | \
-     TPM_TIS_CAP_DATA_TRANSFER_64B | \
-     TPM_TIS_CAP_INTERFACE_VERSION1_3 | \
-     TPM_TIS_INTERRUPTS_SUPPORTED)
-
-#define TPM_TIS_CAPABILITIES_SUPPORTED2_0 \
-    (TPM_TIS_CAP_INTERRUPT_LOW_LEVEL | \
-     TPM_TIS_CAP_BURST_COUNT_DYNAMIC | \
-     TPM_TIS_CAP_DATA_TRANSFER_64B | \
-     TPM_TIS_CAP_INTERFACE_VERSION1_3_FOR_TPM2_0 | \
-     TPM_TIS_INTERRUPTS_SUPPORTED)
 
 #define TPM_TIS_IFACE_ID_INTERFACE_TIS1_3   (0xf)     /* TPM 2.0 */
 #define TPM_TIS_IFACE_ID_INTERFACE_FIFO     (0x0)     /* TPM 2.0 */
@@ -136,104 +110,88 @@ static void tpm_i2c_atmel_show_buffer(const TPMSizedBuffer *sb, const char *stri
  * again. Therefore, we cache the flag here. Once set, it will not be unset
  * except by a reset.
  */
-static void tpm_i2c_atmel_sts_set(TPMLocality *l, uint32_t flags)
+static inline void tpm_i2c_atmel_sts_set(TPMLocality *l, uint32_t flags)
 {
     l->sts &= TPM_TIS_STS_SELFTEST_DONE | TPM_TIS_STS_TPM_FAMILY_MASK;
     l->sts |= flags;
 }
 
-/*
- * Send a request to the TPM.
- */
-static void tpm_i2c_atmel_tpm_send(TPMState *s, uint8_t locty)
+static inline uint32_t tpm_i2c_atmel_tpm_start_recv(TPMState *s)
 {
     TPMTISEmuState *tis = &s->s.tis;
 
-    tpm_i2c_atmel_show_buffer(&tis->loc[locty].w_buffer, "tpm_tis: To TPM");
-
-    s->locty_number = locty;
-    s->locty_data = &tis->loc[locty];
-
-    /*
-     * w_offset serves as length indicator for length of data;
-     * it's reset when the response comes back
-     */
-    tis->loc[locty].state = TPM_TIS_STATE_EXECUTION;
-
-    tpm_backend_deliver_request(s->be_driver);
+    return !(tis->loc[0].sts & TPM_TIS_STS_DATA_AVAILABLE);
 }
 
-/* abort -- this function switches the locality */
-// static void tpm_i2c_atmel_abort(TPMState *s, uint8_t locty)
-// {
-//     TPMTISEmuState *tis = &s->s.tis;
+static inline void tpm_i2c_atmel_tpm_start_send(TPMState *s)
+{
+    TPMTISEmuState *tis = &s->s.tis;
 
-//     tis->loc[locty].r_offset = 0;
-//     tis->loc[locty].w_offset = 0;
+    tis->loc[0].w_offset = 0;
+    tis->loc[0].r_offset = 0;
+}
 
-//     DPRINTF("tpm_tis: tis_abort: new active locality is %d\n", tis->next_locty);
+/*
+ * Send a request to the TPM.
+ */
+static inline void tpm_i2c_atmel_tpm_send(TPMState *s)
+{
+    TPMTISEmuState *tis = &s->s.tis;
 
-//     /*
-//      * Need to react differently depending on who's aborting now and
-//      * which locality will become active afterwards.
-//      */
-//     if (tis->aborting_locty == tis->next_locty) {
-//         tis->loc[tis->aborting_locty].state = TPM_TIS_STATE_READY;
-//         tpm_tis_sts_set(&tis->loc[tis->aborting_locty],
-//                         TPM_TIS_STS_COMMAND_READY);
-//         tpm_tis_raise_irq(s, tis->aborting_locty, TPM_TIS_INT_COMMAND_READY);
-//     }
+    if (tis->loc[0].w_offset &&
+        tis->loc[0].state != TPM_TIS_STATE_EXECUTION) {
+        tpm_i2c_atmel_show_buffer(&tis->loc[0].w_buffer, "tpm_tis: To TPM");
 
-//     /* locality after abort is another one than the current one */
-//     tpm_tis_new_active_locality(s, tis->next_locty);
+        s->locty_number = 0;
+        s->locty_data = &tis->loc[0];
 
-//     tis->next_locty = TPM_TIS_NO_LOCALITY;
-//     /* nobody's aborting a command anymore */
-//     tis->aborting_locty = TPM_TIS_NO_LOCALITY;
-// }
+        /*
+         * w_offset serves as length indicator for length of data;
+         * it's reset when the response comes back
+         */
+        tis->loc[0].state = TPM_TIS_STATE_EXECUTION;
+
+        tpm_backend_deliver_request(s->be_driver);
+    }
+}
 
 
 static void tpm_i2c_atmel_receive_bh(void *opaque)
 {
     TPMState *s = opaque;
     TPMTISEmuState *tis = &s->s.tis;
-    uint8_t locty = s->locty_number;
 
-    tpm_i2c_atmel_sts_set(&tis->loc[locty],
+    tpm_i2c_atmel_sts_set(&tis->loc[0],
                     TPM_TIS_STS_VALID | TPM_TIS_STS_DATA_AVAILABLE);
-    tis->loc[locty].state = TPM_TIS_STATE_COMPLETION;
-    tis->loc[locty].r_offset = 0;
-    tis->loc[locty].w_offset = 0;
-    DPRINTF("tpm_i2c_atmel: tpm_i2c_atmel_receive_bh locty [%d]\n", locty);
-
-    // if (TPM_TIS_IS_VALID_LOCTY(tis->next_locty)) {
-    //     tpm_i2c_atmel_abort(s, locty);
-    // }
+    tis->loc[0].state = TPM_TIS_STATE_COMPLETION;
+    tis->loc[0].r_offset = 0;
+    tis->loc[0].w_offset = 0;
+    DPRINTF("tpm_i2c_atmel: tpm_i2c_atmel_receive_bh");
 
 }
 
 /*
  * Read a byte of response data
  */
-static uint32_t tpm_i2c_atmel_data_read(TPMState *s, uint8_t locty)
+static inline uint32_t tpm_i2c_atmel_data_read(TPMState *s)
 {
     TPMTISEmuState *tis = &s->s.tis;
     uint32_t ret = TPM_TIS_NO_DATA_BYTE;
     uint16_t len;
 
-    if ((tis->loc[locty].sts & TPM_TIS_STS_DATA_AVAILABLE)) {
-        len = tpm_i2c_atmel_get_size_from_buffer(&tis->loc[locty].r_buffer);
+    if ((tis->loc[0].sts & TPM_TIS_STS_DATA_AVAILABLE)) {
+        len = tpm_i2c_atmel_get_size_from_buffer(&tis->loc[0].r_buffer);
 
-        ret = tis->loc[locty].r_buffer.buffer[tis->loc[locty].r_offset++];
-        if (tis->loc[locty].r_offset >= len) {
+        ret = tis->loc[0].r_buffer.buffer[tis->loc[0].r_offset++];
+        if (tis->loc[0].r_offset >= len) {
             /* got last byte */
-            tpm_i2c_atmel_sts_set(&tis->loc[locty], TPM_TIS_STS_VALID);
+            tpm_i2c_atmel_sts_set(&tis->loc[0], TPM_TIS_STS_VALID);
         }
         DPRINTF("tpm_i2c_atmel: tpm_i2c_atmel_data_read byte 0x%02x   [%d]\n",
-                ret, tis->loc[locty].r_offset-1);
+                ret, tis->loc[0].r_offset-1);
     } else {
         DPRINTF("tpm_i2c_atmel: !TPM_TIS_STS_DATA_AVAILABLE [%d]\n",
-                tis->loc[locty].sts);
+                tis->loc[0].sts);
     }
 
     return ret;
@@ -242,30 +200,19 @@ static uint32_t tpm_i2c_atmel_data_read(TPMState *s, uint8_t locty)
 static void tpm_i2c_atmel_event(I2CSlave *i2c, enum i2c_event event)
 {
     TPMState *s = TPM(&(i2c->qdev));
-    TPMTISEmuState *tis = &s->s.tis;
     i2c->busy = 0;
 
     switch (event) {
     case I2C_START_RECV:
-        i2c->busy = !(tis->loc[0].sts & TPM_TIS_STS_DATA_AVAILABLE);
+        i2c->busy = tpm_i2c_atmel_tpm_start_recv(s);
         break;
     case I2C_START_SEND:
-        DPRINTF("I2C_START_SEND\n");
-        tis->loc[0].w_offset = 0;
-        tis->loc[0].r_offset = 0;
+        tpm_i2c_atmel_tpm_start_send(s);
         break;
     case I2C_FINISH:
-        DPRINTF("I2C_FINISH\n");
-        if (tis->loc[0].w_offset &&
-            tis->loc[0].state != TPM_TIS_STATE_EXECUTION) {
-            tpm_i2c_atmel_tpm_send(s, 0);
-        }
-        break;
-    case I2C_NACK:
-        DPRINTF("I2C_NACK\n");
+        tpm_i2c_atmel_tpm_send(s);
         break;
     default:
-        DPRINTF("default\n");
         break;
     }
 }
@@ -273,7 +220,7 @@ static void tpm_i2c_atmel_event(I2CSlave *i2c, enum i2c_event event)
 static int tpm_i2c_atmel_recv(I2CSlave *i2c)
 {
     TPMState *s = TPM(&(i2c->qdev));
-    return tpm_i2c_atmel_data_read(s, 0);
+    return tpm_i2c_atmel_data_read(s);
 }
 
 static int tpm_i2c_atmel_send(I2CSlave *i2c, uint8_t data)
@@ -283,18 +230,16 @@ static int tpm_i2c_atmel_send(I2CSlave *i2c, uint8_t data)
     tis->loc[0].w_buffer.buffer[tis->loc[0].w_offset++] = data;
     return 0;
 }
+
 static void tpm_i2c_atmel_receive_cb(TPMState *s, uint8_t locty,
                                bool is_selftest_done)
 {
     TPMTISEmuState *tis = &s->s.tis;
-    uint8_t l;
 
-    assert(s->locty_number == locty);
+    assert(locty == 0);
 
     if (is_selftest_done) {
-        for (l = 0; l < TPM_TIS_NUM_LOCALITIES; l++) {
-            tis->loc[locty].sts |= TPM_TIS_STS_SELFTEST_DONE;
-        }
+        tis->loc[0].sts |= TPM_TIS_STS_SELFTEST_DONE;
     }
 
     qemu_bh_schedule(tis->bh);
@@ -346,7 +291,6 @@ static void tpm_i2c_atmel_reset(DeviceState *dev)
 {
     TPMState *s = TPM(dev);
     TPMTISEmuState *tis = &s->s.tis;
-    int c;
 
     s->be_tpm_version = tpm_backend_get_tpm_version(s->be_driver);
 
@@ -356,27 +300,25 @@ static void tpm_i2c_atmel_reset(DeviceState *dev)
     tis->next_locty = TPM_TIS_NO_LOCALITY;
     tis->aborting_locty = TPM_TIS_NO_LOCALITY;
 
-    for (c = 0; c < TPM_TIS_NUM_LOCALITIES; c++) {
-        tis->loc[c].access = TPM_TIS_ACCESS_TPM_REG_VALID_STS;
-        switch (s->be_tpm_version) {
-        case TPM_VERSION_UNSPEC:
-            break;
-        case TPM_VERSION_1_2:
-            tis->loc[c].sts = TPM_TIS_STS_TPM_FAMILY1_2;
-            tis->loc[c].iface_id = TPM_TIS_IFACE_ID_SUPPORTED_FLAGS1_3;
-            break;
-        case TPM_VERSION_2_0:
-            tis->loc[c].sts = TPM_TIS_STS_TPM_FAMILY2_0;
-            tis->loc[c].iface_id = TPM_TIS_IFACE_ID_SUPPORTED_FLAGS2_0;
-            break;
-        }
-        tis->loc[c].state = TPM_TIS_STATE_IDLE;
-
-        tis->loc[c].w_offset = 0;
-        tpm_backend_realloc_buffer(s->be_driver, &tis->loc[c].w_buffer);
-        tis->loc[c].r_offset = 0;
-        tpm_backend_realloc_buffer(s->be_driver, &tis->loc[c].r_buffer);
+    /* ATMEL AT97SC3204T only uses locality 0 */
+    memset(tis->loc, 0, sizeof(tis->loc));
+    tis->loc[0].access = TPM_TIS_ACCESS_TPM_REG_VALID_STS;
+    switch (s->be_tpm_version) {
+    case TPM_VERSION_UNSPEC:
+        break;
+    case TPM_VERSION_1_2:
+        tis->loc[0].sts = TPM_TIS_STS_TPM_FAMILY1_2;
+        tis->loc[0].iface_id = TPM_TIS_IFACE_ID_SUPPORTED_FLAGS1_3;
+        break;
+    case TPM_VERSION_2_0:
+        tis->loc[0].sts = TPM_TIS_STS_TPM_FAMILY2_0;
+        tis->loc[0].iface_id = TPM_TIS_IFACE_ID_SUPPORTED_FLAGS2_0;
+        break;
     }
+        tis->loc[0].state = TPM_TIS_STATE_IDLE;
+
+    tpm_backend_realloc_buffer(s->be_driver, &tis->loc[0].w_buffer);
+    tpm_backend_realloc_buffer(s->be_driver, &tis->loc[0].r_buffer);
 
     tpm_i2c_atmel_do_startup_tpm(s);
 }
