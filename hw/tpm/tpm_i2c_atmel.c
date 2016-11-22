@@ -127,6 +127,7 @@ static inline uint32_t tpm_i2c_atmel_tpm_start_recv(TPMState *s)
 static inline void tpm_i2c_atmel_tpm_start_send(TPMState *s)
 {
     TPMTISEmuState *tis = &s->s.tis;
+    tis->loc[0].r_offset = 0;
     tis->loc[0].w_offset = 0;
 }
 
@@ -163,6 +164,8 @@ static void tpm_i2c_atmel_receive_bh(void *opaque)
     tpm_i2c_atmel_sts_set(&tis->loc[0],
                     TPM_TIS_STS_VALID | TPM_TIS_STS_DATA_AVAILABLE);
     tis->loc[0].state = TPM_TIS_STATE_COMPLETION;
+    tis->loc[0].r_offset = 0;
+    tis->loc[0].w_offset = 0;
     DPRINTF("tpm_i2c_atmel: tpm_i2c_atmel_receive_bh");
 
 }
